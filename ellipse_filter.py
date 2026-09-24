@@ -21,6 +21,19 @@ texel centers map onto the same stored texel (tiling repeats, or clamping
 to an edge), each copy keeps its own kernel weight and contributes
 independently.
 
+Atlases and tiles
+-----------------
+:func:`filter_sample_atlas` samples one explicitly addressed tile of a
+shared atlas texture.  The sampling coordinate ``(u, v)`` is tile-local
+(the tile spans ``[0, width) x [0, height)`` in its own space, texel
+centers at integer + 0.5), and each :class:`Tile` carries its own
+``wrap`` mode.  Candidate texel centers of the footprint that fall
+outside the tile rectangle are mapped back **into the same tile**
+(repeat wraps within the tile's own dimensions, clamp sticks to the
+tile's own edge), so a footprint near a tile edge never reads texels of
+neighbouring atlas tiles.  ``FilterResult.texels`` are reported in
+atlas-space indices.
+
 Error semantics
 ---------------
 * Non-finite (NaN/Infinity) or non-numeric numeric inputs, bools passed as
@@ -35,9 +48,10 @@ Error semantics
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Sequence
+from typing import Hashable, Sequence
 
 __all__ = [
     "MAX_TEXTURE_SIZE",
@@ -49,7 +63,9 @@ __all__ = [
     "InvalidInputError",
     "BudgetExceededError",
     "FilterResult",
+    "Tile",
     "filter_sample",
+    "filter_sample_atlas",
 ]
 
 #: Maximum texture width/height (textures are at most 64x64).
@@ -115,6 +131,51 @@ class FilterResult:
     texels: tuple[tuple[int, int], ...]
     count: int
     weight_sum: float
+
+
+@dataclass(frozen=True)
+class Tile:
+    """Rectangular tile region inside a shared atlas texture.
+
+    Attributes:
+        x, y: atlas texel coordinates of the tile's top-left corner
+            (both >= 0).
+        width, height: tile size in texels (both >= 1).
+        wrap: this tile's own boundary mode for footprint candidates
+            that fall outside the tile rectangle (default
+            :attr:`WrapMode.CLAMP`).
+
+    The field types and ranges are validated at construction, so an
+    invalid ``Tile`` can never be built; whether the rectangle fits
+    inside a given atlas is checked by :func:`filter_sample_atlas`.
+    """
+
+    x: int
+    y: int
+    width: int
+    height: int
+    wrap: WrapMode = WrapMode.CLAMP
+
+    def __post_init__(self) -> None:
+        for name in ("x", "y", "width", "height"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise InvalidInputError(
+                    f"Tile.{name}: expected an int, "
+                    f"got {type(value).__name__}"
+                )
+        if self.x < 0 or self.y < 0:
+            raise InvalidInputError(
+                f"Tile origin must be >= (0, 0), got ({self.x}, {self.y})"
+            )
+        if self.width < 1 or self.height < 1:
+            raise InvalidInputError(
+                f"Tile size must be >= 1x1, got {self.width}x{self.height}"
+            )
+        if not isinstance(self.wrap, WrapMode):
+            raise InvalidInputError(
+                f"Tile.wrap: expected a WrapMode member, got {self.wrap!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +276,44 @@ def _validate_budget(budget: object) -> int:
     return budget
 
 
+def _validate_tiles(
+    tiles: object, atlas_width: int, atlas_height: int
+) -> Mapping[Hashable, Tile]:
+    if isinstance(tiles, (str, bytes)) or not isinstance(tiles, Mapping):
+        raise InvalidInputError(
+            f"tiles: expected a mapping of tile id to Tile, "
+            f"got {type(tiles).__name__}"
+        )
+    if len(tiles) == 0:
+        raise InvalidInputError("tiles: must contain at least one tile")
+    for key, tile in tiles.items():
+        if not isinstance(tile, Tile):
+            raise InvalidInputError(
+                f"tiles[{key!r}]: expected a Tile, "
+                f"got {type(tile).__name__}"
+            )
+        if tile.x + tile.width > atlas_width or tile.y + tile.height > atlas_height:
+            raise InvalidInputError(
+                f"tiles[{key!r}]: rect ({tile.x}, {tile.y}, "
+                f"{tile.width}x{tile.height}) does not fit inside the "
+                f"{atlas_width}x{atlas_height} atlas"
+            )
+    return tiles
+
+
+def _lookup_tile(tiles: Mapping[Hashable, Tile], tile_id: object) -> Tile:
+    try:
+        return tiles[tile_id]  # type: ignore[index]
+    except KeyError:
+        raise InvalidInputError(
+            f"tile_id: {tile_id!r} is not a key of tiles"
+        ) from None
+    except TypeError:
+        raise InvalidInputError(
+            f"tile_id: unhashable type {type(tile_id).__name__}"
+        ) from None
+
+
 # ---------------------------------------------------------------------------
 # Core filter
 # ---------------------------------------------------------------------------
@@ -256,9 +355,91 @@ def filter_sample(
     tex, width, height = _validate_texture(texture)
     u = _as_finite_float("u", u)
     v = _as_finite_float("v", v)
-    j00, j01, j10, j11 = _validate_jacobian(jacobian)
+    jacobian4 = _validate_jacobian(jacobian)
     wrap = _validate_wrap(wrap)
     budget = _validate_budget(budget)
+    return _filter_region(tex, u, v, jacobian4, wrap, budget, 0, 0, width, height)
+
+
+def filter_sample_atlas(
+    atlas: Sequence[Sequence[float]],
+    tiles: Mapping[Hashable, Tile],
+    tile_id: Hashable,
+    u: float,
+    v: float,
+    jacobian: Sequence[Sequence[float]],
+    *,
+    budget: int = DEFAULT_BUDGET,
+) -> FilterResult:
+    """Filter one tile of a shared ``atlas`` texture, confined to that tile.
+
+    Args:
+        atlas: rectangular sequence of rows of scalar texel values, at
+            most 64x64.  ``atlas[j][i]`` is the texel whose center is at
+            ``(i + 0.5, j + 0.5)`` in atlas space.
+        tiles: mapping of tile id to :class:`Tile`.  Every tile rectangle
+            must fit inside the atlas.  Each tile carries its own
+            ``wrap`` mode.
+        tile_id: key of the tile to sample; must be present in ``tiles``.
+        u, v: sampling coordinate in **tile-local** space (finite; may be
+            negative or beyond the tile size — out-of-range coordinates
+            are handled by the tile's wrap mode).  The tile spans
+            ``[0, width) x [0, height)`` with texel centers at
+            integer + 0.5.
+        jacobian: 2x2 screen-to-texture Jacobian, same convention as
+            :func:`filter_sample`.
+        budget: maximum number of candidate texel centers inside the
+            footprint bounding box (default 4096).
+
+    Returns:
+        A :class:`FilterResult`.  ``texels`` are **atlas-space** ``(i, j)``
+        indices; every one of them lies inside the selected tile's
+        rectangle — footprint candidates outside the tile are remapped
+        into the tile (repeat wraps within the tile's own dimensions,
+        clamp sticks to the tile's own edge, each copy keeping its own
+        kernel weight), so neighbouring atlas tiles are never read.
+
+    Raises:
+        InvalidInputError: any argument violates the input contract
+            (including an unknown or unhashable ``tile_id``, a malformed
+            ``tiles`` mapping, or a tile rect that escapes the atlas).
+        BudgetExceededError: the footprint bounding box holds more than
+            ``budget`` candidate texels.  No partial result is produced
+            and no point-sampling fallback is performed.
+    """
+    tex, atlas_width, atlas_height = _validate_texture(atlas)
+    valid_tiles = _validate_tiles(tiles, atlas_width, atlas_height)
+    tile = _lookup_tile(valid_tiles, tile_id)
+    u = _as_finite_float("u", u)
+    v = _as_finite_float("v", v)
+    jacobian4 = _validate_jacobian(jacobian)
+    budget = _validate_budget(budget)
+    return _filter_region(
+        tex, u, v, jacobian4, tile.wrap, budget,
+        tile.x, tile.y, tile.width, tile.height,
+    )
+
+
+def _filter_region(
+    tex: tuple[tuple[float, ...], ...],
+    u: float,
+    v: float,
+    jacobian4: tuple[float, float, float, float],
+    wrap: WrapMode,
+    budget: int,
+    origin_x: int,
+    origin_y: int,
+    region_width: int,
+    region_height: int,
+) -> FilterResult:
+    """Core footprint filter over one rectangular region of ``tex``.
+
+    ``(u, v)`` and the candidate scan run in region-local coordinates;
+    candidate centers outside ``[0, region_width) x [0, region_height)``
+    are remapped into the region per ``wrap`` and then offset by
+    ``(origin_x, origin_y)`` into texture-space texel indices.
+    """
+    j00, j01, j10, j11 = jacobian4
 
     # C = J * J^T + 0.25 * I (symmetric positive definite for finite J).
     c00 = j00 * j00 + j01 * j01 + 0.25
@@ -311,11 +492,17 @@ def filter_sample(
             if q <= FOOTPRINT_RADIUS_SQUARED:
                 w = math.exp(-KERNEL_SCALE * q)
                 if wrap is WrapMode.REPEAT:
-                    ti = ix % width
-                    tj = jy % height
+                    ti = origin_x + (ix % region_width)
+                    tj = origin_y + (jy % region_height)
                 else:
-                    ti = 0 if ix < 0 else (width - 1 if ix >= width else ix)
-                    tj = 0 if jy < 0 else (height - 1 if jy >= height else jy)
+                    ri = 0 if ix < 0 else (
+                        region_width - 1 if ix >= region_width else ix
+                    )
+                    rj = 0 if jy < 0 else (
+                        region_height - 1 if jy >= region_height else jy
+                    )
+                    ti = origin_x + ri
+                    tj = origin_y + rj
                 total_weight += w
                 weighted_value += w * tex[tj][ti]
                 weights.append(w)

@@ -8,6 +8,13 @@ against the elliptical footprint filter.
 
 Part 2 shows the budget guard: an enormous footprint is rejected with
 BudgetExceededError instead of silently degrading to point sampling.
+
+Part 3 shows invalid input rejected with a locatable error.
+
+Part 4 shows atlas tiles: two adjacent tiles with per-tile clamp/repeat
+boundary modes.  A footprint crossing the shared seam stays inside its
+own tile (no bleeding into the neighbour), and an unknown tile id is
+rejected with InvalidInputError.
 """
 
 import math
@@ -15,8 +22,10 @@ import math
 from ellipse_filter import (
     BudgetExceededError,
     InvalidInputError,
+    Tile,
     WrapMode,
     filter_sample,
+    filter_sample_atlas,
 )
 
 SIZE = 32
@@ -88,6 +97,36 @@ def main():
         filter_sample(texture, math.nan, 16.0, jacobian)
     except InvalidInputError as err:
         print(f"InvalidInputError: {err}")
+
+    print()
+    print("=== Part 4: atlas tiles with per-tile boundary modes ===")
+    # 16x8 atlas: left 8x8 tile is constant 0.1, right 8x8 tile is
+    # constant 0.9.  A footprint sampled near the shared seam would
+    # bleed across it without tile confinement.
+    atlas = [[0.1 if i < 8 else 0.9 for i in range(16)] for j in range(8)]
+    tiles = {
+        "left": Tile(0, 0, 8, 8, WrapMode.CLAMP),
+        "right": Tile(8, 0, 8, 8, WrapMode.REPEAT),
+    }
+    wide = ((1.5, 0.0), (0.0, 1.5))  # footprint reaches ~4 texels out
+    seam = filter_sample_atlas(atlas, tiles, "left", 7.5, 4.0, wide)
+    bleed = filter_sample(atlas, 7.5, 4.0, wide, wrap=WrapMode.CLAMP)
+    print("two constant 8x8 tiles in one 16x8 atlas: left=0.1, right=0.9")
+    print(f"sample 'left' at local u=7.5 (on the seam), clamp mode:")
+    print(f"  tiled filter value  = {seam.value:.6f}  (stays 0.1, "
+          f"texels x in [{min(i for i, _ in seam.texels)}, "
+          f"{max(i for i, _ in seam.texels)}])")
+    print(f"  whole-atlas filter  = {bleed.value:.6f}  (legacy call "
+          f"bleeds into the right tile, as designed)")
+    neg = filter_sample_atlas(atlas, tiles, "right", -0.5, 4.0, wide)
+    print(f"sample 'right' at local u=-0.5 (negative UV), repeat mode:")
+    print(f"  tiled filter value  = {neg.value:.6f}  (wraps inside the "
+          f"right tile, texels x in [{min(i for i, _ in neg.texels)}, "
+          f"{max(i for i, _ in neg.texels)}])")
+    try:
+        filter_sample_atlas(atlas, tiles, "nope", 4.0, 4.0, wide)
+    except InvalidInputError as err:
+        print(f"unknown tile id -> InvalidInputError: {err}")
 
 
 if __name__ == "__main__":

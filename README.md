@@ -1,6 +1,7 @@
 # ellipse_filter — 纹理各向异性足迹的椭圆滤波
 
-离线图形采样用可复用模块:对标量纹理做 EWA 风格的椭圆高斯足迹滤波。
+离线图形采样用可复用模块:对标量纹理做 EWA 风格的椭圆高斯足迹滤波,
+支持单纹理采样与带显式瓦片 ID、每瓦片边界模式的图集(atlas)采样。
 纯 Python 标准库实现,无第三方依赖。
 
 ## 环境
@@ -16,6 +17,8 @@ python demo.py                            # 运行演示(约 1 秒内完成)
 ```
 
 ## 接口
+
+### 单纹理采样(原有入口,行为不变)
 
 ```python
 from ellipse_filter import filter_sample, WrapMode, FilterResult
@@ -34,6 +37,36 @@ result = filter_sample(
 # result.weight_sum  未归一化的核权总和
 ```
 
+### 图集瓦片采样(本次新增)
+
+```python
+from ellipse_filter import filter_sample_atlas, Tile, WrapMode
+
+tiles = {
+    "grass": Tile(0, 0, 8, 8, WrapMode.CLAMP),    # x, y, 宽, 高, 本瓦片边界模式
+    "water": Tile(8, 0, 8, 8, WrapMode.REPEAT),
+}
+result = filter_sample_atlas(
+    atlas,        # 共享图集纹理,契约同 filter_sample 的 texture(<=64x64)
+    tiles,        # {瓦片ID: Tile},每个矩形必须在图集范围内
+    "grass",      # 显式瓦片 ID(任何可哈希值;必须在 tiles 中)
+    u, v,         # 瓦片局部坐标:瓦片覆盖 [0,宽)x[0,高),像素中心在整数+0.5
+    jacobian,     # 同 filter_sample
+    budget=4096,  # 同 filter_sample
+)
+```
+
+- `u, v` 是**瓦片局部**坐标,可以为负或超出瓦片尺寸:越界部分按该瓦片
+  自己的 `wrap` 模式处理(`REPEAT` 在瓦片自身尺寸内取模,`CLAMP` 夹到
+  瓦片自身边缘),**每个候选副本保留自己的核权**。
+- 足迹越界只映射回本瓦片矩形,**不会读入图集中的无关瓦片**;
+  `result.texels` 以**图集坐标**返回,调用方可直接核验全部落在所选
+  瓦片矩形内。
+- `Tile` 字段在构造时校验(非 int/bool 充当 int、非正尺寸、非法 wrap
+  立即抛 `InvalidInputError`);矩形是否落在图集内由
+  `filter_sample_atlas` 校验。瓦片之间允许重叠,各自独立采样。
+- 一个覆盖整张图集的瓦片与 `filter_sample` 结果完全一致(有测试锁定)。
+
 ## 数学模型
 
 ```
@@ -46,27 +79,32 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 遍历足迹的轴对齐包围盒(半宽 `2*sqrt(C_00)`、`2*sqrt(C_11)`)内的全部
 像素中心,对满足足迹条件者累加核权。`repeat` 取模回绕、`clamp` 夹到
 边缘;多个候选中心映射到同一存储像素时,**每个副本保留自己的核权**,
-独立参与加权。
+独立参与加权。图集模式下,偏移 d 在瓦片局部空间计算,映射被限制在
+所选瓦片矩形内。
 
 ## 输入上限与错误语义
 
-- 纹理最大 64x64,至少 1x1,必须矩形;`budget` 默认 4096。
+- 纹理/图集最大 64x64,至少 1x1,必须矩形;`budget` 默认 4096。
 - `InvalidInputError`(同时是 `ValueError`):数值输入为 NaN/Infinity、
-  bool 充当数值(含 `budget`)、纹理非矩形/为空/超限、Jacobian 非 2x2、
-  `wrap` 非 `WrapMode` 成员、`budget` 非正整数。错误信息指明出错的参数
-  (如 `texture[2][5]`、`jacobian[0][1]`)。
+  bool 充当数值(含 `budget` 与 `Tile` 的整数字段)、纹理非矩形/为空/
+  超限、Jacobian 非 2x2、`wrap` 非 `WrapMode` 成员、`budget` 非正整数。
+  图集模式新增:`tiles` 非映射/为空/值不是 `Tile`、瓦片矩形超出图集、
+  `tile_id` 不在 `tiles` 中或不可哈希。错误信息指明出错的参数
+  (如 `texture[2][5]`、`jacobian[0][1]`、`tiles['grass']`、`tile_id`)。
 - `BudgetExceededError`(同时是 `RuntimeError`,与 `InvalidInputError`
   互不继承):包围盒候选数超过 budget,或 `C` 因巨大 J 溢出为非有限值。
   携带 `candidates` 与 `budget` 属性。**不静默退化为点采样**,异常前不
   产生任何部分结果;预算耗尽与"足迹为空"是不同路径(后者对任意有限
   输入在数学上不可达:最近像素中心的 q <= 2 < 4)。
+- 所有校验在任何累加之前完成,函数无副作用,失败不会留下半更新状态。
 
 ## 误差口径(浮点)
 
 - 常量纹理守恒:`|value - c| <= 1e-12`(仅含浮点累加舍入)。
 - 归一化权重和:`|sum(weights) - 1| <= 1e-12`。
 - 与独立暴力宽盒参考(测试内独立实现,扫描加大盒、独立求逆与累加)
-  比较:值与权重和绝对差 `<= 1e-9`,贡献数严格相等。
+  比较:值与权重和绝对差 `<= 1e-9`,贡献数严格相等。单纹理与图集
+  模式各有一份独立参考。
 - 脉冲解析权重:与闭式 `exp(-8)` 结果绝对差 `<= 1e-15`。
 - 结果本身是离散像素中心加权和,**不是**连续 EWA 积分;与连续积分的
   偏差随足迹增大而减小,本模块不声称二者等价。
@@ -79,7 +117,11 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
   长度相乘得到候选数并检查 budget,避免在报错前陷入长时间循环。
 - **0.25I 正则项**:使退化/零 Jacobian 仍有定义(退化为半径 1 的
   各向同性足迹),不拒绝合法输入。
-- **不可变结果**:`FilterResult` 为 frozen dataclass,权重以元组返回。
+- **不可变结果**:`FilterResult` 与 `Tile` 均为 frozen dataclass,
+  权重以元组返回。
+- **瓦片局部坐标 + 每瓦片 wrap**:越界重映射发生在瓦片自身坐标系内,
+  从结构上保证不串入无关瓦片;`filter_sample` 等价于"一个覆盖整张
+  纹理的瓦片",两种入口共用同一核心循环。
 
 ## 已知限制
 
@@ -88,9 +130,16 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
   模式集(如 mirror、border)。
 - 足迹核在 q=4 处硬截断(边界权约 e^-8 ≈ 3.35e-4),不做尾部补偿。
 - 纹理尺寸上限 64x64、budget 上限语义按本题契约,非行业标准实现。
+- 瓦片矩形必须在图集范围内,但不校验瓦片互不重叠(重叠合法,各瓦片
+  独立采样);不做跨面片导数拆分,也不做图集缝线的重参数化。
+- 图集模式的 `u, v` 是瓦片局部坐标,调用方负责面片到瓦片的坐标换算。
 
 ## 文件
 
-- `ellipse_filter.py` — 核心库(可导入)
-- `tests/test_ellipse_filter.py` — 单元测试与独立暴力宽盒参考
-- `demo.py` — 固定输入演示:点采样 vs 足迹滤波 + budget/非法输入拒绝
+- `ellipse_filter.py` — 核心库(可导入):`filter_sample`、
+  `filter_sample_atlas`、`Tile`、`WrapMode`、`FilterResult` 与错误类型
+- `tests/test_ellipse_filter.py` — 单纹理单元测试与独立暴力宽盒参考
+- `tests/test_tile_atlas.py` — 图集瓦片测试:不串瓦片不变量、角点/负 UV
+  闭式核对、不同尺寸瓦片、全图集等价性与失败用例
+- `demo.py` — 固定输入演示:点采样 vs 足迹滤波、budget/非法输入拒绝、
+  图集瓦片边界模式与未知瓦片 ID 拒绝
