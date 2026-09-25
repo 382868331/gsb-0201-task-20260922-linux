@@ -21,6 +21,30 @@ texel centers map onto the same stored texel (tiling repeats, or clamping
 to an edge), each copy keeps its own kernel weight and contributes
 independently.
 
+Derivatives
+-----------
+:func:`filter_sample_with_derivatives` additionally returns the analytic
+partial derivatives of the filtered value with respect to the sampling
+coordinates ``u`` and ``v`` for a fixed Jacobian.  Both the kernel weights
+and the normalization denominator are differentiated (quotient rule)::
+
+    value = N / D,  N = sum(w_k * t_k),  D = sum(w_k)
+    dw_k/du = -2 * w_k * dq_k/du
+    dvalue/du = (dN/du * D - N * dD/du) / D**2     (same for v)
+
+Every copy of a repeated/clamped texel contributes its own weight
+derivative to the sums before normalization; the derivative is *not* a
+finite difference of final pixel values.
+
+The value is a smooth function of ``(u, v)`` except where the discrete
+candidate set changes, i.e. where some texel center sits exactly on the
+footprint boundary ``q = 4`` (a candidate appears/disappears with weight
+e^-8 != 0).  When such a boundary texel lies outside the stored texture,
+the repeat/clamp mapping of the candidate switches at the same time.
+Positions within ``boundary_tol`` of those events are reported via the
+``nondifferentiable`` flag and human-readable ``reasons`` instead of
+silently returning a derivative that does not exist there.
+
 Error semantics
 ---------------
 * Non-finite (NaN/Infinity) or non-numeric numeric inputs, bools passed as
@@ -44,12 +68,15 @@ __all__ = [
     "DEFAULT_BUDGET",
     "FOOTPRINT_RADIUS_SQUARED",
     "KERNEL_SCALE",
+    "DEFAULT_BOUNDARY_TOL",
     "WrapMode",
     "EllipseFilterError",
     "InvalidInputError",
     "BudgetExceededError",
     "FilterResult",
+    "GradientResult",
     "filter_sample",
+    "filter_sample_with_derivatives",
 ]
 
 #: Maximum texture width/height (textures are at most 64x64).
@@ -63,6 +90,10 @@ FOOTPRINT_RADIUS_SQUARED = 4.0
 
 #: Kernel weight is exp(-KERNEL_SCALE * d^T * C^-1 * d).
 KERNEL_SCALE = 2.0
+
+#: Default tolerance for the nondifferentiability probe: texel centers with
+#: ``|q - FOOTPRINT_RADIUS_SQUARED|`` below this sit "on" the boundary.
+DEFAULT_BOUNDARY_TOL = 1e-9
 
 
 class WrapMode(Enum):
@@ -115,6 +146,35 @@ class FilterResult:
     texels: tuple[tuple[int, int], ...]
     count: int
     weight_sum: float
+
+
+@dataclass(frozen=True)
+class GradientResult:
+    """Result of one footprint-filtered sample with analytic derivatives.
+
+    Attributes:
+        sample: the plain FilterResult; numerically identical to what
+            filter_sample returns for the same arguments.
+        dvalue_du: analytic partial derivative of sample.value with
+            respect to u (Jacobian held fixed).
+        dvalue_dv: analytic partial derivative with respect to v.
+        nondifferentiable: True when the sampling position lies within
+            boundary_tol of a locus where the value is not differentiable
+            (a texel center crossing the footprint boundary, possibly
+            switching the repeat/clamp mapping at the same time).  The
+            returned derivatives are then the one-sided analytic values
+            of the current candidate configuration and should be treated
+            as advisory.
+        reasons: human-readable descriptions of each nearby
+            nondifferentiable locus; empty when nondifferentiable is
+            False.
+    """
+
+    sample: FilterResult
+    dvalue_du: float
+    dvalue_dv: float
+    nondifferentiable: bool
+    reasons: tuple[str, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +273,13 @@ def _validate_budget(budget: object) -> int:
     if budget < 1:
         raise InvalidInputError(f"budget: must be >= 1, got {budget}")
     return budget
+
+
+def _validate_boundary_tol(boundary_tol: object) -> float:
+    tol = _as_finite_float("boundary_tol", boundary_tol)
+    if tol < 0.0:
+        raise InvalidInputError(f"boundary_tol: must be >= 0, got {tol}")
+    return tol
 
 
 # ---------------------------------------------------------------------------
@@ -336,3 +403,210 @@ def filter_sample(
         count=len(weights),
         weight_sum=total_weight,
     )
+
+
+def filter_sample_with_derivatives(
+    texture: Sequence[Sequence[float]],
+    u: float,
+    v: float,
+    jacobian: Sequence[Sequence[float]],
+    *,
+    wrap: WrapMode = WrapMode.REPEAT,
+    budget: int = DEFAULT_BUDGET,
+    boundary_tol: float = DEFAULT_BOUNDARY_TOL,
+) -> GradientResult:
+    """Like :func:`filter_sample`, but also differentiate w.r.t. ``u``/``v``.
+
+    The Jacobian is held fixed.  Both the kernel weights and the
+    normalization denominator are differentiated analytically
+    (quotient rule); every repeat/clamp copy of a stored texel
+    contributes its own weight derivative before the sums are
+    normalized.  This is not a finite difference of final values.
+
+    Args:
+        texture, u, v, jacobian, wrap, budget: identical contract to
+            :func:`filter_sample`.  The budget covers every candidate
+            that participates in the differentiation; derivative mode
+            cannot bypass the 4096 (or custom) candidate limit.
+        boundary_tol: non-negative tolerance of the nondifferentiability
+            probe.  Texel centers whose ``q`` lies within this distance
+            of the footprint boundary (q = 4) mark the position as
+            nondifferentiable.
+
+    Returns:
+        A :class:`GradientResult`.  ``result.sample`` is numerically
+        identical to ``filter_sample(...)`` for the same arguments.
+
+    Raises:
+        InvalidInputError: any argument violates the input contract.
+        BudgetExceededError: the footprint bounding box holds more than
+            ``budget`` candidate texels (checked before any work, exactly
+            as in :func:`filter_sample`).
+    """
+    tex, width, height = _validate_texture(texture)
+    u = _as_finite_float("u", u)
+    v = _as_finite_float("v", v)
+    j00, j01, j10, j11 = _validate_jacobian(jacobian)
+    wrap = _validate_wrap(wrap)
+    budget = _validate_budget(budget)
+    boundary_tol = _validate_boundary_tol(boundary_tol)
+
+    # C = J * J^T + 0.25 * I (symmetric positive definite for finite J).
+    c00 = j00 * j00 + j01 * j01 + 0.25
+    c01 = j00 * j10 + j01 * j11
+    c11 = j10 * j10 + j11 * j11 + 0.25
+    det = c00 * c11 - c01 * c01
+    if not (math.isfinite(c00) and math.isfinite(c11) and math.isfinite(det)):
+        raise BudgetExceededError(
+            "jacobian: C = J*J^T + 0.25*I overflowed to non-finite values; "
+            "the footprint is far larger than any supported budget",
+            candidates=math.inf,
+            budget=budget,
+        )
+
+    inv00 = c11 / det
+    inv01 = -c01 / det
+    inv11 = c00 / det
+
+    half_u = 2.0 * math.sqrt(c00)
+    half_v = 2.0 * math.sqrt(c11)
+
+    lo_i = math.ceil(u - half_u - 0.5)
+    hi_i = math.floor(u + half_u - 0.5)
+    lo_j = math.ceil(v - half_v - 0.5)
+    hi_j = math.floor(v + half_v - 0.5)
+    candidates = (hi_i - lo_i + 1) * (hi_j - lo_j + 1)
+    if candidates > budget:
+        raise BudgetExceededError(
+            f"footprint bounding box holds {candidates} candidate texels, "
+            f"exceeding the budget of {budget}",
+            candidates=candidates,
+            budget=budget,
+        )
+
+    total_weight = 0.0
+    weighted_value = 0.0
+    # d(sum w)/d(u,v) and d(sum w*t)/d(u,v): the normalization
+    # denominator participates in the differentiation.
+    dtotal_du = 0.0
+    dtotal_dv = 0.0
+    dweighted_du = 0.0
+    dweighted_dv = 0.0
+    weights: list[float] = []
+    texels: list[tuple[int, int]] = []
+    for jy in range(lo_j, hi_j + 1):
+        dy = (jy + 0.5) - v
+        for ix in range(lo_i, hi_i + 1):
+            dx = (ix + 0.5) - u
+            q = inv00 * dx * dx + 2.0 * inv01 * dx * dy + inv11 * dy * dy
+            if q <= FOOTPRINT_RADIUS_SQUARED:
+                w = math.exp(-KERNEL_SCALE * q)
+                if wrap is WrapMode.REPEAT:
+                    ti = ix % width
+                    tj = jy % height
+                else:
+                    ti = 0 if ix < 0 else (width - 1 if ix >= width else ix)
+                    tj = 0 if jy < 0 else (height - 1 if jy >= height else jy)
+                t = tex[tj][ti]
+                total_weight += w
+                weighted_value += w * t
+                # dq/du, dq/dv of q = d^T C^-1 d with d = (dx, dy).
+                dq_du = -2.0 * (inv00 * dx + inv01 * dy)
+                dq_dv = -2.0 * (inv01 * dx + inv11 * dy)
+                dw_du = -KERNEL_SCALE * w * dq_du
+                dw_dv = -KERNEL_SCALE * w * dq_dv
+                dtotal_du += dw_du
+                dtotal_dv += dw_dv
+                dweighted_du += dw_du * t
+                dweighted_dv += dw_dv * t
+                weights.append(w)
+                texels.append((ti, tj))
+
+    if not weights:
+        # Unreachable: see filter_sample.
+        raise EllipseFilterError("internal error: footprint contains no texel")
+
+    value = weighted_value / total_weight
+    normalized = tuple(w / total_weight for w in weights)
+    sample = FilterResult(
+        value=value,
+        weights=normalized,
+        texels=tuple(texels),
+        count=len(weights),
+        weight_sum=total_weight,
+    )
+
+    # Quotient rule on value = weighted_value / total_weight.
+    denom = total_weight * total_weight
+    dvalue_du = (dweighted_du * total_weight - weighted_value * dtotal_du) / denom
+    dvalue_dv = (dweighted_dv * total_weight - weighted_value * dtotal_dv) / denom
+
+    reasons = _nondifferentiability_reasons(
+        width, height, u, v, inv00, inv01, inv11,
+        lo_i, hi_i, lo_j, hi_j, wrap, boundary_tol,
+    )
+    return GradientResult(
+        sample=sample,
+        dvalue_du=dvalue_du,
+        dvalue_dv=dvalue_dv,
+        nondifferentiable=bool(reasons),
+        reasons=tuple(reasons),
+    )
+
+
+def _nondifferentiability_reasons(
+    width: int,
+    height: int,
+    u: float,
+    v: float,
+    inv00: float,
+    inv01: float,
+    inv11: float,
+    lo_i: int,
+    hi_i: int,
+    lo_j: int,
+    hi_j: int,
+    wrap: WrapMode,
+    boundary_tol: float,
+) -> list[str]:
+    """Probe texel centers near the footprint boundary q == 4.
+
+    The value is smooth in (u, v) while the contributing candidate set is
+    fixed.  It changes (with a jump of weight e^-8) whenever a texel
+    center crosses the footprint boundary; for out-of-range centers the
+    repeat/clamp mapping of that candidate switches at the same locus.
+    The probe scans the bounding box expanded by one texel on each side,
+    which also covers candidates about to enter the scan range.
+    """
+    reasons: list[str] = []
+    for jy in range(lo_j - 1, hi_j + 2):
+        dy = (jy + 0.5) - v
+        for ix in range(lo_i - 1, hi_i + 2):
+            dx = (ix + 0.5) - u
+            q = inv00 * dx * dx + 2.0 * inv01 * dx * dy + inv11 * dy * dy
+            if abs(q - FOOTPRINT_RADIUS_SQUARED) > boundary_tol:
+                continue
+            state = "inside" if q <= FOOTPRINT_RADIUS_SQUARED else "outside"
+            reason = (
+                f"texel center ({ix}, {jy}) has q={q:.6g} ({state}, within "
+                f"boundary_tol={boundary_tol} of the footprint boundary "
+                f"q={FOOTPRINT_RADIUS_SQUARED}): the candidate set and its "
+                f"weight sum change non-smoothly here"
+            )
+            if not (0 <= ix < width and 0 <= jy < height):
+                if wrap is WrapMode.REPEAT:
+                    reason += (
+                        f"; the repeat mapping of this candidate switches "
+                        f"at the same locus (currently wraps to stored "
+                        f"texel ({ix % width}, {jy % height}))"
+                    )
+                else:
+                    ci = 0 if ix < 0 else (width - 1 if ix >= width else ix)
+                    cj = 0 if jy < 0 else (height - 1 if jy >= height else jy)
+                    reason += (
+                        f"; the clamp mapping of this candidate switches "
+                        f"at the same locus (currently pins to stored "
+                        f"texel ({ci}, {cj}))"
+                    )
+            reasons.append(reason)
+    return reasons

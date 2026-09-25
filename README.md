@@ -11,8 +11,8 @@
 ## 命令
 
 ```bash
-python -m unittest discover -s tests -v   # 运行全部测试
-python demo.py                            # 运行演示(约 1 秒内完成)
+./.venv/bin/python -m unittest discover -s tests -v   # 运行全部测试
+./.venv/bin/python demo.py                            # 运行演示(约 1 秒内完成)
 ```
 
 ## 接口
@@ -34,6 +34,24 @@ result = filter_sample(
 # result.weight_sum  未归一化的核权总和
 ```
 
+固定 Jacobian 下对采样坐标的解析导数:
+
+```python
+from ellipse_filter import filter_sample_with_derivatives, GradientResult
+
+grad = filter_sample_with_derivatives(
+    texture, u, v, jacobian,
+    wrap=WrapMode.REPEAT,
+    budget=4096,                     # 与 filter_sample 同一预算,求导不放宽
+    boundary_tol=1e-9,               # 不可微检测容差(默认 DEFAULT_BOUNDARY_TOL)
+)
+# grad.sample            FilterResult,与 filter_sample 同参数结果逐位一致
+# grad.dvalue_du         value 对 u 的解析偏导(Jacobian 固定)
+# grad.dvalue_dv         value 对 v 的解析偏导
+# grad.nondifferentiable 位于不可微轨迹 boundary_tol 邻域内时为 True
+# grad.reasons           每条附近不可微轨迹的文字说明(安全位置为空)
+```
+
 ## 数学模型
 
 ```
@@ -48,6 +66,28 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 边缘;多个候选中心映射到同一存储像素时,**每个副本保留自己的核权**,
 独立参与加权。
 
+## 导数模型
+
+固定 Jacobian,对采样中心 `(u, v)` 求解析导数。权重与归一化分母都
+参与求导(商法则):
+
+```
+value = N / D,  N = sum(w_k * t_k),  D = sum(w_k)
+dw_k/du = -2 * w_k * dq_k/du,  dq_k/du = -2 * (C^-1 d)_u
+dvalue/du = (dN/du * D - N * dD/du) / D^2        (v 同理)
+```
+
+重复/夹取映射到同一存储像素的副本各自算核权与核权导数后再汇总;
+导数不是对最终像素值的差分。
+
+候选集合固定时 value 关于 `(u, v)` 光滑;当某像素中心恰好落在足迹
+边界 `q = 4` 上时候选集合跳变(权重跳变 e^-8),若该中心在纹理范围
+外,其 repeat/clamp 映射同一时刻切换。`filter_sample_with_derivatives`
+显式探测包围盒外扩一格内的全部像素中心,`|q - 4| <= boundary_tol`
+即置 `nondifferentiable=True` 并在 `reasons` 中说明(含映射切换信息);
+此时返回的导数是当前候选配置下的单侧解析值,仅供参考。普通安全
+位置返回解析导数,可用中心差分核验。
+
 ## 输入上限与错误语义
 
 - 纹理最大 64x64,至少 1x1,必须矩形;`budget` 默认 4096。
@@ -55,6 +95,7 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
   bool 充当数值(含 `budget`)、纹理非矩形/为空/超限、Jacobian 非 2x2、
   `wrap` 非 `WrapMode` 成员、`budget` 非正整数。错误信息指明出错的参数
   (如 `texture[2][5]`、`jacobian[0][1]`)。
+   导数接口额外校验 `boundary_tol` 为有限非负浮点数。
 - `BudgetExceededError`(同时是 `RuntimeError`,与 `InvalidInputError`
   互不继承):包围盒候选数超过 budget,或 `C` 因巨大 J 溢出为非有限值。
   携带 `candidates` 与 `budget` 属性。**不静默退化为点采样**,异常前不
@@ -68,6 +109,8 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 - 与独立暴力宽盒参考(测试内独立实现,扫描加大盒、独立求逆与累加)
   比较:值与权重和绝对差 `<= 1e-9`,贡献数严格相等。
 - 脉冲解析权重:与闭式 `exp(-8)` 结果绝对差 `<= 1e-15`。
+ - 解析导数:在安全位置与中心差分(h=1e-6)绝对差 `<= 1e-6`;常量纹理
+   梯度 `<= 1e-12`(商法则下分子分母导数相消,仅剩舍入)。
 - 结果本身是离散像素中心加权和,**不是**连续 EWA 积分;与连续积分的
   偏差随足迹增大而减小,本模块不声称二者等价。
 
@@ -88,9 +131,16 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
   模式集(如 mirror、border)。
 - 足迹核在 q=4 处硬截断(边界权约 e^-8 ≈ 3.35e-4),不做尾部补偿。
 - 纹理尺寸上限 64x64、budget 上限语义按本题契约,非行业标准实现。
+ - 导数仅对 `(u, v)` 定义(Jacobian 固定);不提供对 J 或纹理值的导数。
+   `nondifferentiable=True` 时导数为单侧参考值;`boundary_tol` 只控制
+   检测邻域,不改变数值结果。
+ - 不加入瓦片(tiling)缓存或多级纹理(mipmap)。
 
 ## 文件
 
 - `ellipse_filter.py` — 核心库(可导入)
 - `tests/test_ellipse_filter.py` — 单元测试与独立暴力宽盒参考
-- `demo.py` — 固定输入演示:点采样 vs 足迹滤波 + budget/非法输入拒绝
+- `demo.py` — 固定输入演示:点采样 vs 足迹滤波 + budget/非法输入拒绝 +
+  解析导数对比中心差分 + 不可微轨迹标记
+- `tests/test_ellipse_filter_gradients.py` — 导数测试:中心差分核验、
+  边界/映射切换检测、预算与校验契约

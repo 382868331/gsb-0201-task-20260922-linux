@@ -17,6 +17,7 @@ from ellipse_filter import (
     InvalidInputError,
     WrapMode,
     filter_sample,
+    filter_sample_with_derivatives,
 )
 
 SIZE = 32
@@ -88,6 +89,32 @@ def main():
         filter_sample(texture, math.nan, 16.0, jacobian)
     except InvalidInputError as err:
         print(f"InvalidInputError: {err}")
+
+    print()
+    print("=== Part 4: analytic d(value)/du, d(value)/dv vs. central diff ===")
+    u, v = 12.7, 17.3
+    grad = filter_sample_with_derivatives(texture, u, v, jacobian)
+    h = 1e-6
+    fd_du = (filter_sample(texture, u + h, v, jacobian).value
+             - filter_sample(texture, u - h, v, jacobian).value) / (2 * h)
+    fd_dv = (filter_sample(texture, u, v + h, jacobian).value
+             - filter_sample(texture, u, v - h, jacobian).value) / (2 * h)
+    print(f"at (u, v) = ({u}, {v}), fixed Jacobian:")
+    print(f"  analytic: du={grad.dvalue_du:+.8f}  dv={grad.dvalue_dv:+.8f}")
+    print(f"  central diff (h={h}): du={fd_du:+.8f}  dv={fd_dv:+.8f}")
+    print(f"  nondifferentiable={grad.nondifferentiable} (safe position)")
+
+    print()
+    print("=== Part 5: nondifferentiable locus is flagged, not hidden ===")
+    # Zero Jacobian: C^-1 = 4 I, so texel center (1.5, 0.5) is exactly at
+    # q = 4 when sampling (0.5, 0.5): a candidate appears/disappears and
+    # its clamp mapping switches at the same time.
+    edge = filter_sample_with_derivatives(
+        texture, 0.5, 0.5, ((0.0, 0.0), (0.0, 0.0)), wrap=WrapMode.CLAMP)
+    print(f"nondifferentiable={edge.nondifferentiable}")
+    for reason in edge.reasons:
+        print(f"  - {reason}")
+    print("  (derivatives at such positions are one-sided/advisory)")
 
 
 if __name__ == "__main__":
