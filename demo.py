@@ -18,6 +18,7 @@ from ellipse_filter import (
     WrapMode,
     filter_sample,
 )
+from ellipse_filter import filter_sample_grad
 
 SIZE = 32
 
@@ -88,6 +89,35 @@ def main():
         filter_sample(texture, math.nan, 16.0, jacobian)
     except InvalidInputError as err:
         print(f"InvalidInputError: {err}")
+
+    print()
+    print("=== Part 4: analytic derivatives of the value w.r.t. (u, v) ===")
+    u, v = 12.37, 17.91
+    grad = filter_sample_grad(texture, u, v, jacobian, wrap=WrapMode.REPEAT)
+    print(f"at (u, v) = ({u}, {v}): value = {grad.value:.6f}")
+    print(f"  analytic  d(value)/du = {grad.grad_u:+.6f}  "
+          f"d(value)/dv = {grad.grad_v:+.6f}")
+    h = 1e-5
+    fd_u = (filter_sample(texture, u + h, v, jacobian).value
+            - filter_sample(texture, u - h, v, jacobian).value) / (2 * h)
+    fd_v = (filter_sample(texture, u, v + h, jacobian).value
+            - filter_sample(texture, u, v - h, jacobian).value) / (2 * h)
+    print(f"  central   d(value)/du = {fd_u:+.6f}  "
+          f"d(value)/dv = {fd_v:+.6f}  (h = {h})")
+    print(f"  differentiable = {grad.differentiable}")
+
+    constant = [[1.5] * SIZE for _ in range(SIZE)]
+    cgrad = filter_sample_grad(constant, u, v, jacobian)
+    print(f"constant texture: grad = ({cgrad.grad_u:+.2e}, "
+          f"{cgrad.grad_v:+.2e})  (exactly zero up to roundoff)")
+
+    # A point exactly on the footprint boundary: zero Jacobian gives
+    # C^-1 = 4I, so texel centers at distance 1 sit at q = 4.
+    zero_j = ((0.0, 0.0), (0.0, 0.0))
+    edge = filter_sample_grad(texture, 0.5, 0.5, zero_j)
+    print(f"footprint-boundary point: differentiable = "
+          f"{edge.differentiable}")
+    print(f"  reason: {edge.nondifferentiable_reason}")
 
 
 if __name__ == "__main__":

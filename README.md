@@ -11,8 +11,8 @@
 ## 命令
 
 ```bash
-python -m unittest discover -s tests -v   # 运行全部测试
-python demo.py                            # 运行演示(约 1 秒内完成)
+./.venv/bin/python -m unittest discover -s tests -v   # 运行全部测试(新旧回归)
+./.venv/bin/python demo.py                            # 运行演示(约 1 秒内完成)
 ```
 
 ## 接口
@@ -33,6 +33,42 @@ result = filter_sample(
 # result.count       实际贡献数
 # result.weight_sum  未归一化的核权总和
 ```
+
+### 对采样中心 (u, v) 的解析导数
+
+    from ellipse_filter import filter_sample_grad, GradientResult
+
+    g = filter_sample_grad(
+        texture, u, v, jacobian,
+        wrap=WrapMode.REPEAT,
+        budget=4096,        # 与 filter_sample 共用同一预算统计,
+                            # 导数模式不会绕过 4096 上限
+        boundary_tol=1e-9,  # q 距足迹边界 4.0 的判定容差
+        edge_tol=1e-9,      # 包围盒边缘距 texel 中心的判定容差
+    )
+    # g.value          与 filter_sample 同输入完全一致(同一扫描与累加)
+    # g.grad_u/g.grad_v 固定 Jacobian 下 value 对 u/v 的解析导数
+    # g.differentiable 是否位于可微位置
+    # g.nondifferentiable_reason  不可微原因(可微时为 None)
+    # g.weights/texels/count/weight_sum  与 FilterResult 相同契约
+
+导数按解析链式法则计算:对 value = A/B(A = sum(w_k*t_k),B = sum(w_k),
+w_k = exp(-2*q_k))同时微分权重与归一化分母(商法则),
+dq/du = -2*(inv00*dx + inv01*dy),dw/du = -2*w*dq/du。
+repeat/clamp 把多个候选中心映射到同一存储 texel 时,每个副本各自
+携带自己的核权导数参与求和,而不是对最终像素值做差分。
+
+以下位置值函数不可微,结果会被显式标记(differentiable=False
+并给出原因),梯度字段仍会填出但不可信:
+
+- 候选距离阈值附近:包围盒内某候选的 q 与足迹边界 4.0 之差不超过
+  boundary_tol(核在 q=4 处硬截断,候选进出时权值跳动 e^-8);
+- clamp/repeat 映射切换处:包围盒边缘与 texel 中心的距离不超过
+  edge_tol,此时候选集合(以及 repeat/clamp 下同一存储 texel 的副本
+  重数)在无穷小扰动下离散变化。
+
+其余位置(普通安全位置)返回解析导数,可用中心差分核验。
+
 
 ## 数学模型
 
@@ -68,6 +104,9 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 - 与独立暴力宽盒参考(测试内独立实现,扫描加大盒、独立求逆与累加)
   比较:值与权重和绝对差 `<= 1e-9`,贡献数严格相等。
 - 脉冲解析权重:与闭式 `exp(-8)` 结果绝对差 `<= 1e-15`。
+- 解析梯度:与测试内独立实现的商法则参考绝对差 <= 1e-9;与
+  filter_sample 的中心差分(h=1e-5)在平滑纹理、安全位置绝对差
+  <= 1e-6;常量纹理梯度 |grad| <= 1e-12(仅累加舍入)。
 - 结果本身是离散像素中心加权和,**不是**连续 EWA 积分;与连续积分的
   偏差随足迹增大而减小,本模块不声称二者等价。
 
@@ -87,10 +126,16 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 - 重复/夹取只按本题两种模式实现,不宣称兼容任何图形 API 的完整寻址
   模式集(如 mirror、border)。
 - 足迹核在 q=4 处硬截断(边界权约 e^-8 ≈ 3.35e-4),不做尾部补偿。
+- 由于硬截断,值函数在候选跨越 q=4 处存在约 e^-8 量级的跳变,
+  导数在这些点不存在;filter_sample_grad 只做检测与标记,
+  不提供跨跳变的次梯度或平滑化。
 - 纹理尺寸上限 64x64、budget 上限语义按本题契约,非行业标准实现。
 
 ## 文件
 
 - `ellipse_filter.py` — 核心库(可导入)
 - `tests/test_ellipse_filter.py` — 单元测试与独立暴力宽盒参考
-- `demo.py` — 固定输入演示:点采样 vs 足迹滤波 + budget/非法输入拒绝
+- `tests/test_ellipse_grad.py` — 导数测试:独立商法则参考、中心差分核验、
+  repeat 缝两侧、clamp 边外、重合副本、不可微标记、巨大足迹预算
+- `demo.py` — 固定输入演示:点采样 vs 足迹滤波 + budget/非法输入拒绝 +
+  解析导数与中心差分对照
