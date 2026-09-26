@@ -1,6 +1,12 @@
-# ellipse_filter — 纹理各向异性足迹的椭圆滤波
+# ellipse_filter + ripmap — 纹理各向异性足迹滤波
 
-离线图形采样用可复用模块:对标量纹理做 EWA 风格的椭圆高斯足迹滤波。
+离线图形采样用可复用模块,包含两个入口:
+
+- `ellipse_filter.py`:EWA 风格的椭圆高斯足迹滤波(旧入口,行为不变)。
+- `ripmap.py`:ripmap 构建与采样。横纵两个方向分别做面积平均降采样,
+  长条足迹不再被强行压成一个标量 LOD,而是沿两个轴各选一个层级,
+  在四个相邻层之间双线性插值。
+
 纯 Python 标准库实现,无第三方依赖。
 
 ## 环境
@@ -8,14 +14,75 @@
 - Python 3.14.7,Linux 原生运行
 - 仅标准库,安装 Python 后无需任何额外依赖(`requirements.txt` 为空注释)
 
+## venv 准备(可选)
+
+不需要任何第三方包,venv 仅用于隔离解释器:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+系统 Python 3.14.7 直接运行下面的命令即可,无需激活 venv。
+
 ## 命令
 
 ```bash
 python -m unittest discover -s tests -v   # 运行全部测试
-python demo.py                            # 运行演示(约 1 秒内完成)
+python demo_iteration.py                  # ripmap 演示(现场计算,远小于 90 秒)
+python demo.py                            # 旧 EWA 演示(约 1 秒内完成)
 ```
 
-## 接口
+## ripmap 接口
+
+```python
+from ripmap import build_ripmap, sample_ripmap
+from ellipse_filter import WrapMode
+
+rip = build_ripmap(texture)          # texture[j][i],最大 64x64,至少 1x1
+rip.level_sizes()                    # [lod_u][lod_v] 索引的各层 (宽, 高)
+
+result = sample_ripmap(
+    rip, u, v, jacobian,             # 与 EWA 入口相同的坐标与 2x2 Jacobian
+    wrap=WrapMode.REPEAT,            # 或 WrapMode.CLAMP,层内寻址约定不变
+)
+# result.value       四个相邻层双线性插值后的滤波值
+# result.lod_u/lod_v 实际使用的每轴连续层级(已夹到 [0, max_lod])
+# result.radius_u/radius_v  足迹沿两轴的半径(像素)
+# result.degenerate  退化足迹(零/奇异 J)时为 True,层级明确为 (0, 0)
+# result.samples     四条 LevelSample 记录:层号、层尺寸、层内像素、
+#                    混合权重、读到的值 —— 层级选择与层内采样全部留痕
+```
+
+### ripmap 数学模型
+
+```
+C = J * J^T + 0.25 * I                    (与 EWA 入口相同)
+radius_u = 2*sqrt(C_00), radius_v = 2*sqrt(C_11)   (每轴足迹半径,像素)
+lod_axis = clamp(log2(radius_axis), 0, max_lod_axis)
+```
+
+- 层 (a, b) 尺寸为 `ceil(W/2^a) x ceil(H/2^b)`,逐轴减半构建;每个输出
+  像素是它覆盖的 1 或 2 个输入像素的面积加权平均。**奇数边长时最后一
+  行/列以覆盖权重 1 保留**,不直接丢弃。
+- 采样时取 (a0, a1) x (b0, b1) 四个相邻层,按 (lod_u - a0, lod_v - b0)
+  双线性混合;层内把 (u, v) 按该层记录尺寸缩放后取最近像素,越界按
+  repeat/clamp 处理(与 EWA 入口同一约定)。
+- 非法输入(NaN/Inf、bool 当数值、非矩形纹理、非法 wrap 等)抛
+  `InvalidInputError`,错误信息指明参数;退化足迹(零/奇异 J)不是
+  错误,结果为 LOD (0, 0) 且 `degenerate=True`。
+
+### ripmap 误差口径
+
+- 常量纹理守恒:`|value - c| <= 1e-12`。
+- 与测试内独立参考(在原图上对轴对齐足迹矩形做精确逐像素覆盖面积
+  积分)比较:水平高频/竖向平滑纹理上绝对差 `<= 0.05`;伪随机纹理、
+  轴对齐足迹下绝对差 `<= 0.15`。误差来自层内最近点采样与层级双线
+  性混合,是**近似**,不是精确积分。
+- **不声称对任意旋转椭圆做精确积分**:层级选择只看 C 的轴对齐半径,
+  旋转信息被忽略;旋转足迹只保证结果落在纹理值域内。
+
+## EWA 接口(旧入口,不变)
 
 ```python
 from ellipse_filter import filter_sample, WrapMode, FilterResult
@@ -34,7 +101,7 @@ result = filter_sample(
 # result.weight_sum  未归一化的核权总和
 ```
 
-## 数学模型
+## EWA 数学模型
 
 ```
 C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
@@ -61,7 +128,7 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
   产生任何部分结果;预算耗尽与"足迹为空"是不同路径(后者对任意有限
   输入在数学上不可达:最近像素中心的 q <= 2 < 4)。
 
-## 误差口径(浮点)
+## EWA 误差口径(浮点)
 
 - 常量纹理守恒:`|value - c| <= 1e-12`(仅含浮点累加舍入)。
 - 归一化权重和:`|sum(weights) - 1| <= 1e-12`。
@@ -84,6 +151,8 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 ## 已知限制
 
 - 仅标量(单通道)纹理;不实现 mip 链、三线性或饱和截断(summed-area)。
+- ripmap 是轴对齐面积平均的近似:层内最近点采样 + 四层级双线性混合,
+  不是任意旋转椭圆的精确积分,也不做层内双线性过滤。
 - 重复/夹取只按本题两种模式实现,不宣称兼容任何图形 API 的完整寻址
   模式集(如 mirror、border)。
 - 足迹核在 q=4 处硬截断(边界权约 e^-8 ≈ 3.35e-4),不做尾部补偿。
@@ -92,5 +161,9 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 ## 文件
 
 - `ellipse_filter.py` — 核心库(可导入)
+- `ripmap.py` — ripmap 构建与各向异性两轴 LOD 采样(可导入)
 - `tests/test_ellipse_filter.py` — 单元测试与独立暴力宽盒参考
+- `tests/test_ripmap.py` — ripmap 测试与独立原图面积积分参考、异常路径
 - `demo.py` — 固定输入演示:点采样 vs 足迹滤波 + budget/非法输入拒绝
+- `demo_iteration.py` — ripmap 演示:奇数尺寸建层、两轴 LOD 采样对比
+  独立面积积分、退化足迹与非法输入(全部现场计算)
