@@ -1,21 +1,75 @@
-# ellipse_filter — 纹理各向异性足迹的椭圆滤波
+# ellipse_filter + ripmap — 纹理各向异性足迹滤波
 
-离线图形采样用可复用模块:对标量纹理做 EWA 风格的椭圆高斯足迹滤波。
+离线图形采样用可复用模块,包含两部分:
+
+- ellipse_filter.py:对标量纹理做 EWA 风格的椭圆高斯足迹滤波(基线,接口不变)。
+- ripmap.py:ripmap 构建与采样,沿 u/v 两个轴独立选择分辨率,
+  不把长条足迹压成一个标量 LOD。
+
 纯 Python 标准库实现,无第三方依赖。
 
 ## 环境
 
 - Python 3.14.7,Linux 原生运行
-- 仅标准库,安装 Python 后无需任何额外依赖(`requirements.txt` 为空注释)
+- 仅标准库,安装 Python 后无需任何额外依赖(requirements.txt 为空注释)
+
+## venv 准备
+
+    python3.14 -m venv .venv        # 或 python -m venv .venv(确认版本为 3.14.7)
+    source .venv/bin/activate
+    # 无第三方依赖,不需要 pip install
 
 ## 命令
 
-```bash
-python -m unittest discover -s tests -v   # 运行全部测试
-python demo.py                            # 运行演示(约 1 秒内完成)
-```
+    python -m unittest discover -s tests -v   # 运行全部测试
+    python demo.py                            # EWA 椭圆滤波演示(约 1 秒内完成)
+    python demo_iteration.py                  # ripmap 演示(现场计算,远小于 90 秒)
 
-## 接口
+## ripmap 接口
+
+    from ripmap import build_ripmap, ripmap_sample, Ripmap, RipmapResult
+    from ellipse_filter import WrapMode
+
+    ripmap = build_ripmap(texture)   # texture[j][i],最大 64x64,契约同 EWA 入口
+    result = ripmap_sample(
+        ripmap,
+        u, v,         # 纹理空间采样坐标(像素中心位于整数+0.5)
+        jacobian,     # 2x2 屏幕到纹理 Jacobian
+        wrap=WrapMode.REPEAT,   # 或 WrapMode.CLAMP,层内寻址约定与 EWA 一致
+    )
+    # result.value      四角层级混合后的最终值
+    # result.level_u    连续(小数)层级,按 sqrt(C_00) 取 log2 后夹到已建层级
+    # result.level_v    同上,按 sqrt(C_11)
+    # result.corners    四个 LevelSample:整数层级、该层尺寸、层级混合权、
+    #                   层内双线性采样到的像素索引与权重(权重和为 1)
+    # result.count      全部角点的像素贡献总数
+
+### ripmap 数学模型
+
+- 层级 (lu, lv):基础纹理沿 u 降采样 2^lu 倍、沿 v 降采样 2^lv 倍;
+  每步对 2 个相邻像素做面积平均。奇数边长时末尾输出像素只覆盖 1 个
+  输入像素,按实际覆盖权重(2 或 1)平均,不丢最后一列/行。
+  所有层尺寸通过 ripmap.all_sizes() / ripmap.size(lu, lv) 查询。
+- 层级选择:C = J * J^T + 0.25 * I(与 EWA 同一足迹模型),
+  lambda_u = log2(sqrt(C_00))、lambda_v = log2(sqrt(C_11)),
+  夹到 [0, levels-1];在四个相邻整数层级间按双线性权混合。
+- 层内:双线性采样,repeat 取模回绕、clamp 夹到边缘,与 EWA 入口一致。
+- 退化足迹(零/奇异 Jacobian)合法,层级夹到 0;J 溢出为非有限值时
+  对应轴取最粗层级。非法输入(NaN/Inf、bool、畸形 Jacobian/纹理、
+  非法 wrap)抛 InvalidInputError。
+
+### ripmap 误差口径
+
+- 常量纹理守恒:|value - c| <= 1e-12。
+- 角点层级混合权之和、每个角点层内权重之和均为 1(<= 1e-12 误差)。
+- 与测试内独立参考(对原图做足迹盒 [u-su, u+su] x [v-sv, v+sv] 的
+  精确面积积分,逐像素覆盖裁剪,repeat 寻址)比较:
+  水平高频/竖向平滑纹理在 su=8 时误差 < 0.06;各向同性 su=sv=2 的
+  平滑纹理误差 < 0.15(ripmap 的帐篷形预滤波只是盒式积分的近似)。
+- ripmap 是轴对齐盒近似:旋转椭圆用其轴对齐外接范围近似,
+  **不是**任意旋转椭圆足迹的精确积分;误差随旋转角与偏心率增大而增大。
+
+## EWA 接口(基线,不变)
 
 ```python
 from ellipse_filter import filter_sample, WrapMode, FilterResult
@@ -91,6 +145,10 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 
 ## 文件
 
-- `ellipse_filter.py` — 核心库(可导入)
-- `tests/test_ellipse_filter.py` — 单元测试与独立暴力宽盒参考
-- `demo.py` — 固定输入演示:点采样 vs 足迹滤波 + budget/非法输入拒绝
+- `ellipse_filter.py` — EWA 椭圆足迹滤波核心库(可导入,接口不变)
+- `ripmap.py` — ripmap 构建与采样(可导入,复用 ellipse_filter 的校验与寻址)
+- `tests/test_ellipse_filter.py` — EWA 单元测试与独立暴力宽盒参考
+- `tests/test_ripmap.py` — ripmap 单元测试与原图面积积分独立参考
+- `demo.py` — EWA 固定输入演示:点采样 vs 足迹滤波 + budget/非法输入拒绝
+- `demo_iteration.py` — ripmap 演示:层级尺寸表、点采样/ripmap/精确盒积分对比、
+  层级选择记录、退化与非法输入路径
