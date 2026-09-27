@@ -1,7 +1,7 @@
 """Elliptic footprint filtering for anisotropic texture sampling.
 
-Reusable, dependency-free module (Python standard library only) implementing
-an EWA-style elliptical Gaussian footprint filter for scalar textures.
+Reusable, dependency-free module (Python standard library only) implementing an
+EWA-style elliptical Gaussian footprint filter for scalar and RGBA textures.
 
 Model
 -----
@@ -20,6 +20,13 @@ Wrap modes ``repeat`` and ``clamp`` are supported.  When several candidate
 texel centers map onto the same stored texel (tiling repeats, or clamping
 to an edge), each copy keeps its own kernel weight and contributes
 independently.
+
+RGBA textures use rows of four-channel texels.  The caller must state whether
+those texels are premultiplied or straight (unpremultiplied).  Straight colors
+are converted to premultiplied before filtering, so fully transparent texels
+contribute black color instead of leaking their irrelevant stored RGB values.
+All four channels are filtered with the same spatial kernel weights; alpha is
+not used as an additional color weight.
 
 Error semantics
 ---------------
@@ -45,6 +52,7 @@ __all__ = [
     "FOOTPRINT_RADIUS_SQUARED",
     "KERNEL_SCALE",
     "WrapMode",
+    "AlphaMode",
     "EllipseFilterError",
     "InvalidInputError",
     "BudgetExceededError",
@@ -70,6 +78,14 @@ class WrapMode(Enum):
 
     REPEAT = "repeat"
     CLAMP = "clamp"
+
+
+class AlphaMode(Enum):
+    """Alpha representation used by RGBA texture input and output."""
+
+    PREMULTIPLIED = "premultiplied"
+    STRAIGHT = "straight"
+    UNPREMULTIPLIED = "straight"
 
 
 class EllipseFilterError(Exception):
@@ -100,7 +116,9 @@ class FilterResult:
     """Result of one footprint-filtered sample.
 
     Attributes:
-        value: normalized filtered value, ``sum(w_k * t_k) / sum(w_k)``.
+        value: normalized filtered scalar, or an ``(r, g, b, a)`` tuple for
+            RGBA textures.  RGBA output uses the same alpha representation
+            requested by the caller.
         weights: per-contribution kernel weights, normalized to sum 1,
             in row-major scan order over candidate texel centers.
         texels: ``(i, j)`` texel indices (column, row) actually sampled,
@@ -110,7 +128,7 @@ class FilterResult:
         weight_sum: raw (unnormalized) kernel weight sum.
     """
 
-    value: float
+    value: float | tuple[float, float, float, float]
     weights: tuple[float, ...]
     texels: tuple[tuple[int, int], ...]
     count: int
@@ -133,19 +151,26 @@ def _as_finite_float(name: str, value: object) -> float:
     return result
 
 
-def _validate_texture(texture: object) -> tuple[tuple[tuple[float, ...], ...], int, int]:
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _validate_texture(
+    texture: object,
+) -> tuple[tuple[tuple[float, ...] | tuple[float, float, float, float], ...], int, int, int]:
     if isinstance(texture, (str, bytes)) or not isinstance(texture, Sequence):
         raise InvalidInputError(
             f"texture: expected a sequence of rows, got {type(texture).__name__}"
         )
     if len(texture) == 0:
         raise InvalidInputError("texture: must contain at least one row")
-    rows: list[tuple[float, ...]] = []
+    rows: list[tuple[float, ...] | tuple[float, float, float, float]] = []
     width: int | None = None
+    channels = 1
     for r, row in enumerate(texture):
         if isinstance(row, (str, bytes)) or not isinstance(row, Sequence):
             raise InvalidInputError(
-                f"texture[{r}]: expected a sequence of numbers, "
+                f"texture[{r}]: expected a sequence of numbers or RGBA texels, "
                 f"got {type(row).__name__}"
             )
         if width is None:
@@ -157,10 +182,47 @@ def _validate_texture(texture: object) -> tuple[tuple[tuple[float, ...], ...], i
                 f"texture[{r}]: row has {len(row)} columns, expected {width} "
                 "(texture must be rectangular)"
             )
-        converted = []
-        for c, value in enumerate(row):
-            converted.append(_as_finite_float(f"texture[{r}][{c}]", value))
-        rows.append(tuple(converted))
+        row_channels = 1 if len(row) > 0 and _is_number(row[0]) else 4
+        if r == 0:
+            channels = row_channels
+        elif row_channels != channels:
+            raise InvalidInputError(
+                f"texture[{r}]: mixes scalar and RGBA texels; all rows must "
+                "use the same texture format"
+            )
+
+        if channels == 1:
+            converted = []
+            for c, value in enumerate(row):
+                converted.append(_as_finite_float(f"texture[{r}][{c}]", value))
+            rows.append(tuple(converted))
+        else:
+            converted_row = []
+            for c, texel in enumerate(row):
+                if isinstance(texel, (str, bytes)) or not isinstance(texel, Sequence):
+                    raise InvalidInputError(
+                        f"texture[{r}][{c}]: expected an RGBA sequence, "
+                        f"got {type(texel).__name__}"
+                    )
+                if len(texel) != 4:
+                    raise InvalidInputError(
+                        f"texture[{r}][{c}]: expected 4 RGBA channels, "
+                        f"got {len(texel)}"
+                    )
+                converted = tuple(
+                    _as_finite_float(
+                        f"texture[{r}][{c}][{channel}]", value
+                    )
+                    for channel, value in enumerate(texel)
+                )
+                alpha = converted[3]
+                if not 0.0 <= alpha <= 1.0:
+                    raise InvalidInputError(
+                        f"texture[{r}][{c}][3]: alpha must be in [0, 1], "
+                        f"got {alpha}"
+                    )
+                converted_row.append(converted)
+            rows.append(tuple(converted_row))
     height = len(rows)
     assert width is not None
     if width > MAX_TEXTURE_SIZE or height > MAX_TEXTURE_SIZE:
@@ -168,7 +230,32 @@ def _validate_texture(texture: object) -> tuple[tuple[tuple[float, ...], ...], i
             f"texture: size {width}x{height} exceeds the "
             f"{MAX_TEXTURE_SIZE}x{MAX_TEXTURE_SIZE} limit"
         )
-    return tuple(rows), width, height
+    return tuple(rows), width, height, channels
+
+
+def _validate_alpha_mode(alpha_mode: object, channels: int) -> AlphaMode | None:
+    if channels == 1:
+        if alpha_mode is not None and not isinstance(alpha_mode, AlphaMode):
+            raise InvalidInputError(
+                "alpha_mode: expected an AlphaMode member or None for scalar "
+                f"textures, got {alpha_mode!r}"
+            )
+        return None
+    if not isinstance(alpha_mode, AlphaMode):
+        raise InvalidInputError(
+            "alpha_mode: RGBA textures require an explicit AlphaMode member, "
+            f"got {alpha_mode!r}"
+        )
+    return alpha_mode
+
+
+def _to_premultiplied(
+    texel: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    red, green, blue, alpha = texel
+    if alpha == 0.0:
+        return 0.0, 0.0, 0.0, alpha
+    return red * alpha, green * alpha, blue * alpha, alpha
 
 
 def _validate_jacobian(jacobian: object) -> tuple[float, float, float, float]:
@@ -221,20 +308,22 @@ def _validate_budget(budget: object) -> int:
 
 
 def filter_sample(
-    texture: Sequence[Sequence[float]],
+    texture: Sequence[Sequence[float | Sequence[float]]],
     u: float,
     v: float,
     jacobian: Sequence[Sequence[float]],
     *,
     wrap: WrapMode = WrapMode.REPEAT,
     budget: int = DEFAULT_BUDGET,
+    alpha_mode: AlphaMode | None = None,
 ) -> FilterResult:
     """Filter ``texture`` at ``(u, v)`` with the elliptical footprint of ``jacobian``.
 
     Args:
-        texture: rectangular sequence of rows of scalar texel values,
-            at most 64x64.  ``texture[j][i]`` is the texel whose center is
-            at ``(i + 0.5, j + 0.5)`` in texture space.
+        texture: rectangular scalar texture or RGBA texture, at most 64x64.
+            ``texture[j][i]`` is the texel whose center is at
+            ``(i + 0.5, j + 0.5)`` in texture space.  RGBA texels are
+            four-element sequences.
         u, v: sampling coordinate in texture space (finite).
         jacobian: 2x2 screen-to-texture Jacobian ``J``; the footprint uses
             ``C = J * J^T + 0.25 * I``, so any finite ``J`` (including
@@ -242,6 +331,10 @@ def filter_sample(
         wrap: :class:`WrapMode` for out-of-range texel coordinates.
         budget: maximum number of candidate texel centers inside the
             footprint bounding box (default 4096).
+        alpha_mode: required for RGBA textures and ignored for scalar
+            textures.  Selects premultiplied or straight alpha for both input
+            and output; straight input is converted to premultiplied only for
+            filtering.
 
     Returns:
         A :class:`FilterResult` with the filtered value, the normalized
@@ -253,12 +346,13 @@ def filter_sample(
             ``budget`` candidate texels.  No partial result is produced
             and no point-sampling fallback is performed.
     """
-    tex, width, height = _validate_texture(texture)
+    tex, width, height, channels = _validate_texture(texture)
     u = _as_finite_float("u", u)
     v = _as_finite_float("v", v)
     j00, j01, j10, j11 = _validate_jacobian(jacobian)
     wrap = _validate_wrap(wrap)
     budget = _validate_budget(budget)
+    alpha_mode = _validate_alpha_mode(alpha_mode, channels)
 
     # C = J * J^T + 0.25 * I (symmetric positive definite for finite J).
     c00 = j00 * j00 + j01 * j01 + 0.25
@@ -300,7 +394,7 @@ def filter_sample(
         )
 
     total_weight = 0.0
-    weighted_value = 0.0
+    weighted_value = 0.0 if channels == 1 else [0.0, 0.0, 0.0, 0.0]
     weights: list[float] = []
     texels: list[tuple[int, int]] = []
     for jy in range(lo_j, hi_j + 1):
@@ -316,8 +410,17 @@ def filter_sample(
                 else:
                     ti = 0 if ix < 0 else (width - 1 if ix >= width else ix)
                     tj = 0 if jy < 0 else (height - 1 if jy >= height else jy)
+                texel = tex[tj][ti]
                 total_weight += w
-                weighted_value += w * tex[tj][ti]
+                if channels == 1:
+                    weighted_value += w * texel
+                else:
+                    if alpha_mode is AlphaMode.STRAIGHT:
+                        texel = _to_premultiplied(texel)
+                    elif texel[3] == 0.0:
+                        texel = (0.0, 0.0, 0.0, 0.0)
+                    for channel in range(4):
+                        weighted_value[channel] += w * texel[channel]
                 weights.append(w)
                 texels.append((ti, tj))
 
@@ -327,7 +430,23 @@ def filter_sample(
         # so its q is <= 2 < FOOTPRINT_RADIUS_SQUARED.
         raise EllipseFilterError("internal error: footprint contains no texel")
 
-    value = weighted_value / total_weight
+    if channels == 1:
+        value = weighted_value / total_weight
+    else:
+        filtered = tuple(accum / total_weight for accum in weighted_value)
+        if alpha_mode is AlphaMode.STRAIGHT:
+            alpha = filtered[3]
+            if alpha == 0.0:
+                value = (0.0, 0.0, 0.0, 0.0)
+            else:
+                value = (
+                    filtered[0] / alpha,
+                    filtered[1] / alpha,
+                    filtered[2] / alpha,
+                    alpha,
+                )
+        else:
+            value = filtered
     normalized = tuple(w / total_weight for w in weights)
     return FilterResult(
         value=value,

@@ -11,6 +11,7 @@ import math
 import unittest
 
 from ellipse_filter import (
+    AlphaMode,
     BudgetExceededError,
     DEFAULT_BUDGET,
     FilterResult,
@@ -22,6 +23,10 @@ from ellipse_filter import (
 
 def make_texture(width, height, fn):
     return [[fn(i, j) for i in range(width)] for j in range(height)]
+
+
+def make_rgba_texture(width, height, fn):
+    return [[tuple(fn(i, j)) for i in range(width)] for j in range(height)]
 
 
 def pseudo_random_texture(width, height):
@@ -122,6 +127,193 @@ class TestWideBoxReference(unittest.TestCase):
             self.assertEqual(result.count, expected_count)
             self.assertAlmostEqual(result.value, expected_value, delta=1e-9)
             self.assertAlmostEqual(result.weight_sum, expected_sum, delta=1e-9)
+
+
+class TestRGBAFiltering(unittest.TestCase):
+    def test_opaque_constant_conserved_in_both_alpha_modes(self):
+        straight = make_rgba_texture(
+            8, 8, lambda i, j: (0.25, 0.5, 0.75, 1.0)
+        )
+        premultiplied = [
+            [(0.25, 0.5, 0.75, 1.0) for _ in range(8)] for _ in range(8)
+        ]
+        jacobian = ((1.1, -0.3), (0.4, 0.9))
+
+        straight_result = filter_sample(
+            straight, 3.5, 4.5, jacobian, alpha_mode=AlphaMode.STRAIGHT
+        )
+        premultiplied_result = filter_sample(
+            premultiplied,
+            3.5,
+            4.5,
+            jacobian,
+            alpha_mode=AlphaMode.PREMULTIPLIED,
+        )
+
+        self.assertEqual(len(straight_result.value), 4)
+        for got, want in zip(straight_result.value, (0.25, 0.5, 0.75, 1.0)):
+            self.assertAlmostEqual(got, want, delta=1e-12)
+        for got, want in zip(
+            premultiplied_result.value, (0.25, 0.5, 0.75, 1.0)
+        ):
+            self.assertAlmostEqual(got, want, delta=1e-12)
+        self.assertEqual(
+            straight_result.weights, premultiplied_result.weights
+        )
+
+    def test_transparent_color_does_not_bleed_in_straight_texture(self):
+        def texel(i, j):
+            if (i, j) == (4, 4):
+                return (1.0, 0.0, 0.0, 1.0)
+            return (0.0, 1.0, 0.0, 0.0)
+
+        texture = make_rgba_texture(9, 9, texel)
+        result = filter_sample(
+            texture,
+            4.5,
+            4.5,
+            ((0.0, 0.0), (0.0, 0.0)),
+            wrap=WrapMode.CLAMP,
+            alpha_mode=AlphaMode.STRAIGHT,
+        )
+
+        edge = math.exp(-8.0)
+        expected_alpha = 1.0 / (1.0 + 4.0 * edge)
+        red, green, blue, alpha = result.value
+        self.assertAlmostEqual(red, 1.0, delta=1e-12)
+        self.assertAlmostEqual(green, 0.0, delta=1e-12)
+        self.assertAlmostEqual(blue, 0.0, delta=1e-12)
+        self.assertAlmostEqual(alpha, expected_alpha, delta=1e-12)
+
+    def test_transparent_color_does_not_bleed_in_premultiplied_texture(self):
+        def texel(i, j):
+            if (i, j) == (4, 4):
+                return (1.0, 0.0, 0.0, 1.0)
+            return (0.8, 0.9, 0.1, 0.0)
+
+        texture = make_rgba_texture(9, 9, texel)
+        result = filter_sample(
+            texture,
+            4.5,
+            4.5,
+            ((0.0, 0.0), (0.0, 0.0)),
+            wrap=WrapMode.CLAMP,
+            alpha_mode=AlphaMode.PREMULTIPLIED,
+        )
+
+        edge = math.exp(-8.0)
+        expected_alpha = 1.0 / (1.0 + 4.0 * edge)
+        self.assertAlmostEqual(result.value[0], expected_alpha, delta=1e-12)
+        self.assertAlmostEqual(result.value[1], 0.0, delta=1e-12)
+        self.assertAlmostEqual(result.value[2], 0.0, delta=1e-12)
+        self.assertAlmostEqual(result.value[3], expected_alpha, delta=1e-12)
+
+    def test_output_distinguishes_transparent_from_opaque_black(self):
+        transparent = make_rgba_texture(
+            4, 4, lambda i, j: (0.0, 0.0, 0.0, 0.0)
+        )
+        opaque_black = make_rgba_texture(
+            4, 4, lambda i, j: (0.0, 0.0, 0.0, 1.0)
+        )
+        jacobian = ((0.0, 0.0), (0.0, 0.0))
+
+        transparent_result = filter_sample(
+            transparent,
+            1.5,
+            1.5,
+            jacobian,
+            alpha_mode=AlphaMode.UNPREMULTIPLIED,
+        )
+        opaque_result = filter_sample(
+            opaque_black,
+            1.5,
+            1.5,
+            jacobian,
+            alpha_mode=AlphaMode.STRAIGHT,
+        )
+
+        self.assertEqual(transparent_result.value, (0.0, 0.0, 0.0, 0.0))
+        self.assertEqual(opaque_result.value, (0.0, 0.0, 0.0, 1.0))
+
+    def test_rgba_alpha_uses_same_spatial_weights_as_scalar(self):
+        scalar = make_texture(9, 9, lambda i, j: 1.0 if (i, j) == (4, 4) else 0.0)
+        rgba = make_rgba_texture(
+            9, 9,
+            lambda i, j: (0.0, 0.0, 0.0, 1.0)
+            if (i, j) == (4, 4)
+            else (0.0, 0.0, 0.0, 0.0),
+        )
+        jacobian = ((1.2, -0.4), (0.3, 0.8))
+
+        scalar_result = filter_sample(scalar, 4.5, 4.5, jacobian)
+        rgba_result = filter_sample(
+            rgba,
+            4.5,
+            4.5,
+            jacobian,
+            alpha_mode=AlphaMode.PREMULTIPLIED,
+        )
+
+        self.assertEqual(rgba_result.weights, scalar_result.weights)
+        self.assertEqual(rgba_result.texels, scalar_result.texels)
+        self.assertAlmostEqual(
+            rgba_result.value[3], scalar_result.value, delta=1e-12
+        )
+
+    def test_straight_partial_alpha_round_trip(self):
+        texture = make_rgba_texture(
+            5, 5, lambda i, j: (0.4, 0.6, 0.8, 0.25)
+        )
+        result = filter_sample(
+            texture,
+            2.5,
+            2.5,
+            ((0.7, 0.2), (-0.1, 0.5)),
+            alpha_mode=AlphaMode.STRAIGHT,
+        )
+        for got, want in zip(result.value, (0.4, 0.6, 0.8, 0.25)):
+            self.assertAlmostEqual(got, want, delta=1e-12)
+
+    def test_rgba_validation(self):
+        good = make_rgba_texture(2, 2, lambda i, j: (0.0, 0.0, 0.0, 1.0))
+        jacobian = ((0.0, 0.0), (0.0, 0.0))
+
+        with self.assertRaises(InvalidInputError):
+            filter_sample(good, 1.5, 1.5, jacobian)
+        with self.assertRaises(InvalidInputError):
+            filter_sample(
+                good, 1.5, 1.5, jacobian, alpha_mode="straight"
+            )
+        with self.assertRaises(InvalidInputError):
+            bad = [[(0.0, 0.0, 1.0) for _ in range(2)] for _ in range(2)]
+            filter_sample(
+                bad,
+                1.5,
+                1.5,
+                jacobian,
+                alpha_mode=AlphaMode.STRAIGHT,
+            )
+        with self.assertRaises(InvalidInputError):
+            bad = [[(0.0, 0.0, 0.0, 1.1) for _ in range(2)] for _ in range(2)]
+            filter_sample(
+                bad,
+                1.5,
+                1.5,
+                jacobian,
+                alpha_mode=AlphaMode.STRAIGHT,
+            )
+        with self.assertRaises(InvalidInputError):
+            mixed = [
+                [1.0, (0.0, 0.0, 0.0, 1.0)],
+                [1.0, (0.0, 0.0, 0.0, 1.0)],
+            ]
+            filter_sample(
+                mixed,
+                1.0,
+                1.0,
+                jacobian,
+                alpha_mode=AlphaMode.STRAIGHT,
+            )
 
     def test_matches_independent_reference_clamp(self):
         texture = pseudo_random_texture(12, 10)
