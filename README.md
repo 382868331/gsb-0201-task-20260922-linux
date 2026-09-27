@@ -1,6 +1,6 @@
 # ellipse_filter — 纹理各向异性足迹的椭圆滤波
 
-离线图形采样用可复用模块:对标量纹理做 EWA 风格的椭圆高斯足迹滤波。
+离线图形采样用可复用模块:对标量及 RGBA 纹理做 EWA 风格的椭圆高斯足迹滤波。
 纯 Python 标准库实现,无第三方依赖。
 
 ## 环境
@@ -18,16 +18,17 @@ python demo.py                            # 运行演示(约 1 秒内完成)
 ## 接口
 
 ```python
-from ellipse_filter import filter_sample, WrapMode, FilterResult
+from ellipse_filter import AlphaMode, WrapMode, filter_sample
 
 result = filter_sample(
-    texture,      # 序列的序列:texture[j][i],行=v 方向,列=u 方向
+    texture,      # 标量 texture[j][i],或 RGBA (r,g,b,a) 纹素
     u, v,         # 纹理空间采样坐标(像素中心位于整数+0.5)
     jacobian,     # 2x2 屏幕到纹理 Jacobian J = ((du/dx, du/dy), (dv/dx, dv/dy))
     wrap=WrapMode.REPEAT,   # 或 WrapMode.CLAMP
     budget=4096,            # 包围盒候选像素上限
+    alpha_mode=None,        # RGBA 必填:PREMULTIPLIED 或 UNPREMULTIPLIED
 )
-# result.value       归一化滤波值
+# result.value       标量为 float;RGBA 为 (r,g,b,a)
 # result.weights     每个贡献的归一化核权(和为 1),按行主序扫描顺序
 # result.texels      与 weights 对齐的 (i, j) 像素索引;同一像素可重复出现
 # result.count       实际贡献数
@@ -43,6 +44,18 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 输出: value = sum(w_k * t_k) / sum(w_k)
 ```
 
+RGBA 的 `r/g/b/a` 使用同一组空间权重,不单独计算颜色足迹。输入分量均在
+`[0,1]`:
+
+- `AlphaMode.PREMULTIPLIED`:输入为 `(r*a, g*a, b*a, a)`,直接滤波,输出仍为
+  预乘 RGBA;校验要求 `0 <= r,g,b <= a`。
+- `AlphaMode.UNPREMULTIPLIED`:输入为非预乘 `(r,g,b,a)`,进入累加前先转换成
+  预乘值,滤波后若 `a>0` 再除以滤波后的 alpha 还原非预乘 RGB,输出表示与
+  输入一致。
+- 完全透明纹素以预乘 `(0,0,0,0)` 参与滤波,因此透明像素携带的任意存储色不会
+  在边缘形成明显色边;真正的不透明黑是 `(0,0,0,1)`,二者通过 alpha 区分。
+- 标量旧用法不需要也不能传 RGBA 纹素;`alpha_mode=None` 时保持原有单通道行为。
+
 遍历足迹的轴对齐包围盒(半宽 `2*sqrt(C_00)`、`2*sqrt(C_11)`)内的全部
 像素中心,对满足足迹条件者累加核权。`repeat` 取模回绕、`clamp` 夹到
 边缘;多个候选中心映射到同一存储像素时,**每个副本保留自己的核权**,
@@ -50,11 +63,13 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 
 ## 输入上限与错误语义
 
-- 纹理最大 64x64,至少 1x1,必须矩形;`budget` 默认 4096。
+- 纹理最大 64x64,至少 1x1,必须矩形;纹素必须全部为标量或全部为 RGBA 四元组;
+  `budget` 默认 4096。
 - `InvalidInputError`(同时是 `ValueError`):数值输入为 NaN/Infinity、
   bool 充当数值(含 `budget`)、纹理非矩形/为空/超限、Jacobian 非 2x2、
-  `wrap` 非 `WrapMode` 成员、`budget` 非正整数。错误信息指明出错的参数
-  (如 `texture[2][5]`、`jacobian[0][1]`)。
+  `wrap` 非 `WrapMode` 成员、`budget` 非正整数、RGBA 未声明表示、颜色/alpha
+  超出范围或预乘颜色大于 alpha。错误信息指明出错的参数(如
+  `texture[2][5][1]`、`jacobian[0][1]`)。
 - `BudgetExceededError`(同时是 `RuntimeError`,与 `InvalidInputError`
   互不继承):包围盒候选数超过 budget,或 `C` 因巨大 J 溢出为非有限值。
   携带 `candidates` 与 `budget` 属性。**不静默退化为点采样**,异常前不
@@ -63,7 +78,7 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 
 ## 误差口径(浮点)
 
-- 常量纹理守恒:`|value - c| <= 1e-12`(仅含浮点累加舍入)。
+- 常量纹理守恒:标量 `|value - c| <= 1e-12`;RGBA 四个分量同口径守恒。
 - 归一化权重和:`|sum(weights) - 1| <= 1e-12`。
 - 与独立暴力宽盒参考(测试内独立实现,扫描加大盒、独立求逆与累加)
   比较:值与权重和绝对差 `<= 1e-9`,贡献数严格相等。
@@ -83,7 +98,8 @@ C = J * J^T + 0.25 * I                    (对任意有限 J 均对称正定)
 
 ## 已知限制
 
-- 仅标量(单通道)纹理;不实现 mip 链、三线性或饱和截断(summed-area)。
+- 支持标量和 4 通道 RGBA;不支持 RGB-only/其他通道布局,也不实现 mip 链、
+  三线性或饱和截断(summed-area)。
 - 重复/夹取只按本题两种模式实现,不宣称兼容任何图形 API 的完整寻址
   模式集(如 mirror、border)。
 - 足迹核在 q=4 处硬截断(边界权约 e^-8 ≈ 3.35e-4),不做尾部补偿。

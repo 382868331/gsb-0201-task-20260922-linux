@@ -11,6 +11,7 @@ import math
 import unittest
 
 from ellipse_filter import (
+    AlphaMode,
     BudgetExceededError,
     DEFAULT_BUDGET,
     FilterResult,
@@ -68,6 +69,47 @@ def reference_filter(texture, u, v, jacobian, wrap, box_radius=12):
                 accum += w * texture[tj][ti]
                 count += 1
     return accum / total, total, count
+
+
+def reference_filter_rgba(texture, u, v, jacobian, wrap, alpha_mode, box_radius=12):
+    height = len(texture)
+    width = len(texture[0])
+    total = 0.0
+    accum = [0.0, 0.0, 0.0, 0.0]
+    count = 0
+    ci = math.floor(u)
+    cj = math.floor(v)
+    (j00, j01), (j10, j11) = jacobian
+    c00 = j00 * j00 + j01 * j01 + 0.25
+    c01 = j00 * j10 + j01 * j11
+    c11 = j10 * j10 + j11 * j11 + 0.25
+    det = c00 * c11 - c01 * c01
+    m00, m01, m11 = c11 / det, -c01 / det, c00 / det
+
+    for jy in range(cj - box_radius, cj + box_radius + 1):
+        for ix in range(ci - box_radius, ci + box_radius + 1):
+            dx = ix + 0.5 - u
+            dy = jy + 0.5 - v
+            q = m00 * dx * dx + 2.0 * m01 * dx * dy + m11 * dy * dy
+            if q <= 4.0:
+                w = math.exp(-2.0 * q)
+                if wrap is WrapMode.REPEAT:
+                    ti, tj = ix % width, jy % height
+                else:
+                    ti = min(max(ix, 0), width - 1)
+                    tj = min(max(jy, 0), height - 1)
+                r, g, b, a = texture[tj][ti]
+                if alpha_mode is AlphaMode.UNPREMULTIPLIED:
+                    r, g, b = (0.0, 0.0, 0.0) if a == 0.0 else (r * a, g * a, b * a)
+                total += w
+                for channel, channel_value in enumerate((r, g, b, a)):
+                    accum[channel] += w * channel_value
+                count += 1
+
+    pr, pg, pb, pa = [value / total for value in accum]
+    if alpha_mode is AlphaMode.UNPREMULTIPLIED and pa > 0.0:
+        return (pr / pa, pg / pa, pb / pa, pa), total, count
+    return (pr, pg, pb, pa), total, count
 
 
 class TestConstantConservation(unittest.TestCase):
@@ -343,6 +385,108 @@ class TestResultContract(unittest.TestCase):
         # Result is immutable.
         with self.assertRaises(Exception):
             result.value = 0.0
+
+
+class TestColorTexture(unittest.TestCase):
+    def test_premultiplied_transparent_does_not_make_color_fringe(self):
+        texture = [
+            [(1.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0, 0.0)],
+            [(1.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0, 0.0)],
+        ]
+        result = filter_sample(
+            texture, 0.5, 0.5, ((0.0, 0.0), (0.0, 0.0)),
+            wrap=WrapMode.REPEAT,
+            alpha_mode=AlphaMode.PREMULTIPLIED,
+        )
+        r, g, b, a = result.value
+        edge = math.exp(-8.0)
+        expected_alpha = (1.0 + 2.0 * edge) / (1.0 + 4.0 * edge)
+        self.assertAlmostEqual(r, expected_alpha, places=12)
+        self.assertEqual((g, b), (0.0, 0.0))
+        self.assertAlmostEqual(a, expected_alpha, places=12)
+
+    def test_premultiplied_preserves_opaque_black(self):
+        texture = [[(0.0, 0.0, 0.0, 1.0)]]
+        result = filter_sample(
+            texture, 0.5, 0.5, ((0.0, 0.0), (0.0, 0.0)),
+            alpha_mode=AlphaMode.PREMULTIPLIED,
+        )
+        self.assertEqual(result.value, (0.0, 0.0, 0.0, 1.0))
+
+    def test_unpremultiplied_transparent_returns_zero_rgb(self):
+        texture = [[(0.9, 0.7, 0.1, 0.0)]]
+        result = filter_sample(
+            texture, 0.5, 0.5, ((0.0, 0.0), (0.0, 0.0)),
+            wrap=WrapMode.CLAMP,
+            alpha_mode=AlphaMode.UNPREMULTIPLIED,
+        )
+        r, g, b, a = result.value
+        self.assertEqual(result.value, (0.0, 0.0, 0.0, 0.0))
+
+    def test_matches_reference_for_both_representations(self):
+        unpremultiplied = make_texture(
+            8, 6, lambda i, j: ((i * 37 + j * 13) % 11 / 10,
+                                (i * 19 + j * 29) % 9 / 8,
+                                (i * 7 + j * 41) % 7 / 6,
+                                (i + j) % 3 / 2)
+        )
+        premultiplied = [
+            [(r * a, g * a, b * a, a) for r, g, b, a in row]
+            for row in unpremultiplied
+        ]
+        jacobian = ((1.4, 0.5), (-0.7, 1.1))
+        for wrap in (WrapMode.REPEAT, WrapMode.CLAMP):
+            expected_un, total, count = reference_filter_rgba(
+                unpremultiplied, 3.7, 2.6, jacobian, wrap,
+                AlphaMode.UNPREMULTIPLIED,
+            )
+            result_un = filter_sample(
+                unpremultiplied, 3.7, 2.6, jacobian, wrap=wrap,
+                alpha_mode=AlphaMode.UNPREMULTIPLIED,
+            )
+            self.assertEqual(result_un.count, count)
+            self.assertAlmostEqual(result_un.weight_sum, total, delta=1e-9)
+            for got, want in zip(result_un.value, expected_un):
+                self.assertAlmostEqual(got, want, delta=1e-9)
+
+            result_pm = filter_sample(
+                premultiplied, 3.7, 2.6, jacobian, wrap=wrap,
+                alpha_mode=AlphaMode.PREMULTIPLIED,
+            )
+            expected_pm = (
+                expected_un[0] * expected_un[3],
+                expected_un[1] * expected_un[3],
+                expected_un[2] * expected_un[3],
+                expected_un[3],
+            )
+            for got, want in zip(result_pm.value, expected_pm):
+                self.assertAlmostEqual(got, want, delta=1e-9)
+
+    def test_color_validation(self):
+        jacobian = ((0.0, 0.0), (0.0, 0.0))
+        with self.assertRaises(InvalidInputError):
+            filter_sample([[(1.0, 0.0, 0.0, 1.0)]], 0.5, 0.5, jacobian)
+        with self.assertRaises(InvalidInputError):
+            filter_sample([[(1.0, 0.0, 0.0)]], 0.5, 0.5, jacobian,
+                          alpha_mode=AlphaMode.PREMULTIPLIED)
+        with self.assertRaises(InvalidInputError):
+            filter_sample([[(1.1, 0.0, 0.0, 1.0)]], 0.5, 0.5, jacobian,
+                          alpha_mode=AlphaMode.PREMULTIPLIED)
+        with self.assertRaises(InvalidInputError):
+            filter_sample([[(0.5, 0.0, 0.0, 0.4)]], 0.5, 0.5, jacobian,
+                          alpha_mode=AlphaMode.PREMULTIPLIED)
+        with self.assertRaises(InvalidInputError):
+            filter_sample([[(1.1, 0.0, 0.0, 0.5)]], 0.5, 0.5, jacobian,
+                          alpha_mode=AlphaMode.UNPREMULTIPLIED)
+        with self.assertRaises(InvalidInputError):
+            filter_sample([[(0.5, 0.0, 0.0, 1.1)]], 0.5, 0.5, jacobian,
+                          alpha_mode=AlphaMode.UNPREMULTIPLIED)
+        with self.assertRaises(InvalidInputError):
+            filter_sample([[0.0, (0.0, 0.0, 0.0, 1.0)]], 0.5, 0.5,
+                          jacobian, alpha_mode=AlphaMode.PREMULTIPLIED)
+        with self.assertRaises(InvalidInputError):
+            filter_sample([[1.0]], 0.5, 0.5, jacobian,
+                          alpha_mode=AlphaMode.PREMULTIPLIED)
 
 
 if __name__ == "__main__":
